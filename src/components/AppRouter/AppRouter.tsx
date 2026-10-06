@@ -8,7 +8,7 @@ export default function AppRouter() {
         <BrowserRouter>
             <Routes>
                 <Route path='/' element={<LoginPage />} />
-                <Route path='/rooms/:roomId' element={<RoomPage />} />
+                <Route path='/room/:roomId' element={<RoomPage />} />
                 <Route path="*" element={<div className="flex min-h-screen items-center justify-center">Страница не найдена</div>} />
             </Routes>
             <Toaster position="top-center" richColors closeButton />

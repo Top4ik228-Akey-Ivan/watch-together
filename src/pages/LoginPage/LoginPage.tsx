@@ -1,65 +1,79 @@
-import { useState } from 'react';
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { useState } from "react";
+import { useNavigate } from "react-router";
+
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { toast } from 'sonner';
+import { parseYoutubeUrl } from "@/lib/parseYoutubeUrl";
+import { createRoomId } from "@/lib/roomId";
 
-export default function LoginPage() {
-    const [roomName, setRoomName] = useState('');
+export default function CreateRoomCard() {
+  const navigate = useNavigate();
 
-    const handleCreateRoom = (e: React.FormEvent) => {
-        e.preventDefault();
-        if (!roomName.trim()) {
-            toast.error('Пожалуйста, введите название комнаты!');
-            return;
-        }
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
 
-        // Имитация успешного действия
-        toast.success(`Комната "${roomName}" успешно создана!`, {
-            description: 'Теперь можно подключать PeerJS',
-        });
-        setRoomName('');
-    };
+  const handleCreateRoom = () => {
+    const videoId = parseYoutubeUrl(url);
 
-    return (
-        <div className="flex min-h-screen flex-col items-center justify-center bg-background p-4 antialiased text-foreground">
-            {/* Главная карточка shadcn */}
-            <Card className="w-full max-w-md shadow-lg transition-all duration-300 hover:shadow-xl">
-                <CardHeader className="space-y-1">
-                    <CardTitle className="text-2xl font-bold tracking-tight">
-                        🍿 Watch Together
-                    </CardTitle>
-                    <CardDescription>
-                        Создайте комнату для совместного просмотра видео
-                    </CardDescription>
-                </CardHeader>
+    if (!videoId) {
+      setError("Это не похоже на ссылку YouTube");
+      return;
+    }
 
-                <form onSubmit={handleCreateRoom}>
-                    <CardContent className="space-y-4">
-                        <div className="space-y-1">
-                            <label htmlFor="room" className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
-                                Название комнаты
-                            </label>
-                            {/* Инпут shadcn */}
-                            <Input
-                                id="room"
-                                type="text"
-                                placeholder="Например: Сериалы на вечер"
-                                value={roomName}
-                                onChange={(e) => setRoomName(e.target.value)}
-                                className="w-full"
-                            />
-                        </div>
-                    </CardContent>
+    navigate(`/room/${createRoomId()}`, {
+      state: { host: true, videoId },
+    });
+  };
 
-                    <CardFooter>
-                        {/* Кнопка shadcn */}
-                        <Button type="submit" className="w-full font-semibold cursor-pointer">
-                            Создать сессию
-                        </Button>
-                    </CardFooter>
-                </form>
-            </Card>
-        </div>
-    );
+  return (
+    <div className="flex min-h-screen items-center justify-center p-4">
+      <Card className="w-full max-w-md">
+        <CardHeader>
+          <CardTitle>🍿 Watch Together</CardTitle>
+          <CardDescription>
+            Создайте комнату и смотрите YouTube вместе с друзьями.
+          </CardDescription>
+        </CardHeader>
+
+        <CardContent>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              handleCreateRoom();
+            }}
+            className="space-y-4"
+          >
+            <Input
+              value={url}
+              onChange={(event) => {
+                setUrl(event.target.value);
+                if (error) setError("");
+              }}
+              placeholder="https://www.youtube.com/watch?v=..."
+              aria-invalid={!!error}
+              autoComplete="off"
+              autoFocus
+            />
+
+            {error && (
+              <p role="alert" className="text-sm text-destructive">
+                {error}
+              </p>
+            )}
+
+            <Button type="submit" className="w-full">
+              Создать комнату
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  );
 }
