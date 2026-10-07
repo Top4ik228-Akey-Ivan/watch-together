@@ -8,192 +8,279 @@ const PLAYING = 1;
 const PAUSED = 2;
 const BUFFERING = 3;
 
-const IGNORE_MS = 800;        // окно игнора после обычной команды
-const IGNORE_LOAD_MS = 3000;  // окно игнора после загрузки нового видео
-const SEEK_THRESHOLD = 0.5;   // расхождение позиции, после которого делаем seekTo
+const IGNORE_MS = 800; // «глухота» после обычной команды
+const IGNORE_LOAD_MS = 3000; // «глухота» после загрузки нового видео
 const EXPECT_MS = 15_000; // сколько ждём ответное событие на свою команду
+const SEEK_THRESHOLD = 0.5; // расхождение, после которого применяем seekTo
+
+const POLL_MS = 500; // период опроса позиции (детектор перемотки)
+const JUMP_PLAYING = 1.0; // скачок позиции при воспроизведении = перемотка
+const JUMP_PAUSED = 0.5; // скачок позиции на паузе = перемотка
+const DEDUPE_MS = 400; // защита от двойной отправки одного и того же
 
 // Минимальный тип нативного плеера YouTube (методы синхронные)
 type Player = {
-    getPlayerState(): number;
-    getCurrentTime(): number;
-    playVideo(): void;
-    pauseVideo(): void;
-    seekTo(seconds: number, allowSeekAhead: boolean): void;
-    loadVideoById(o: { videoId: string; startSeconds?: number }): void;
-    cueVideoById(o: { videoId: string; startSeconds?: number }): void;
+  getPlayerState(): number;
+  getCurrentTime(): number;
+  playVideo(): void;
+  pauseVideo(): void;
+  seekTo(seconds: number, allowSeekAhead: boolean): void;
+  loadVideoById(o: { videoId: string; startSeconds?: number }): void;
+  cueVideoById(o: { videoId: string; startSeconds?: number }): void;
 };
 
 type Options = {
-    initialVideoId?: string;
-    onLocalChange: (s: PlayerState) => void;
-    onError: (text: string) => void;
+  initialVideoId?: string;
+  onLocalChange: (s: PlayerState) => void;
+  onError: (text: string) => void;
 };
 
 function errorText(code: number): string {
-    switch (code) {
-        case 2:
-            return "Некорректная ссылка на видео";
-        case 100:
-            return "Видео недоступно";
-        case 101:
-        case 150:
-            return "Автор запретил встраивание этого видео";
-        default:
-            return "Ошибка воспроизведения";
-    }
+  switch (code) {
+    case 2:
+      return "Некорректная ссылка на видео";
+    case 100:
+      return "Видео недоступно";
+    case 101:
+    case 150:
+      return "Автор запретил встраивание этого видео";
+    default:
+      return "Ошибка воспроизведения";
+  }
 }
 
 export function usePlayer({ initialVideoId, onLocalChange, onError }: Options) {
-    const [ready, setReady] = useState(false);
-    const [startVideoId, setStartVideoId] = useState<string | null>(
-        initialVideoId ?? null,
-    );
+  const [ready, setReady] = useState(false);
+  const [startVideoId, setStartVideoId] = useState<string | null>(
+    initialVideoId ?? null,
+  );
 
-    const playerRef = useRef<Player | null>(null);
-    const videoIdRef = useRef<string | null>(initialVideoId ?? null);
-    const ignoreUntil = useRef(0);
-    const pendingRef = useRef<PlayerState | null>(null);
-    const expected = useRef<{ isPlaying: boolean; until: number } | null>(null);
+  const playerRef = useRef<Player | null>(null);
+  const videoIdRef = useRef<string | null>(initialVideoId ?? null);
+  const ignoreUntil = useRef(0);
+  const pendingRef = useRef<PlayerState | null>(null);
+  const expected = useRef<{ isPlaying: boolean; until: number } | null>(null);
 
+  // Трекер позиции для детектора перемотки: где плеер был и когда
+  const trackerRef = useRef({ pos: 0, at: Date.now() });
+  // Последняя отправка (защита от дублей: событие + опрос на одно действие)
+  const lastEmitRef = useRef({ at: 0, isPlaying: false });
 
-    // Всегда свежие колбэки без пересоздания обработчиков
-    const onLocalChangeRef = useRef(onLocalChange);
-    const onErrorRef = useRef(onError);
-    useEffect(() => {
-        onLocalChangeRef.current = onLocalChange;
-        onErrorRef.current = onError;
-    });
+  // Всегда свежие колбэки без пересоздания обработчиков
+  const onLocalChangeRef = useRef(onLocalChange);
+  const onErrorRef = useRef(onError);
+  useEffect(() => {
+    onLocalChangeRef.current = onLocalChange;
+    onErrorRef.current = onError;
+  });
 
-    // ---------- Снимок текущего состояния ----------
-    const getState = useCallback((): PlayerState | null => {
-        const p = playerRef.current;
-        const videoId = videoIdRef.current;
-        if (!p || !videoId) return null;
+  // ---------- Снимок текущего состояния ----------
+  const getState = useCallback((): PlayerState | null => {
+    const p = playerRef.current;
+    const videoId = videoIdRef.current;
+    if (!p || !videoId) return null;
 
-        const st = p.getPlayerState();
-        return {
-            videoId,
-            isPlaying: st === PLAYING || st === BUFFERING,
-            position: p.getCurrentTime(),
-        };
-    }, []);
+    const st = p.getPlayerState();
+    return {
+      videoId,
+      isPlaying: st === PLAYING || st === BUFFERING,
+      position: p.getCurrentTime(),
+    };
+  }, []);
 
-    // ---------- Применить состояние к готовому плееру ----------
-    const apply = useCallback((s: PlayerState) => {
-        const p = playerRef.current;
-        if (!p) return;
+  // ---------- Единая точка отправки локальных изменений ----------
+  const emitLocal = useCallback(() => {
+    const s = getState();
+    if (!s) return;
 
-        expected.current = { isPlaying: s.isPlaying, until: Date.now() + EXPECT_MS };
+    const now = Date.now();
+    trackerRef.current = { pos: s.position, at: now };
+    lastEmitRef.current = { at: now, isPlaying: s.isPlaying };
+    onLocalChangeRef.current(s);
+  }, [getState]);
 
-        // Другое видео: загружаем с нужной позиции
-        if (s.videoId !== videoIdRef.current) {
-            ignoreUntil.current = Date.now() + IGNORE_LOAD_MS;
-            videoIdRef.current = s.videoId;
+  // ---------- Применить состояние к готовому плееру ----------
+  const apply = useCallback((s: PlayerState) => {
+    const p = playerRef.current;
+    if (!p) return;
 
-            if (s.isPlaying) {
-                p.loadVideoById({ videoId: s.videoId, startSeconds: s.position });
-            } else {
-                p.cueVideoById({ videoId: s.videoId, startSeconds: s.position });
-            }
-            return;
+    const now = Date.now();
+    expected.current = { isPlaying: s.isPlaying, until: now + EXPECT_MS };
+
+    // Другое видео: загружаем с нужной позиции
+    if (s.videoId !== videoIdRef.current) {
+      ignoreUntil.current = now + IGNORE_LOAD_MS;
+      videoIdRef.current = s.videoId;
+      trackerRef.current = { pos: s.position, at: now };
+
+      if (s.isPlaying) {
+        p.loadVideoById({ videoId: s.videoId, startSeconds: s.position });
+      } else {
+        p.cueVideoById({ videoId: s.videoId, startSeconds: s.position });
+      }
+      return;
+    }
+
+    // То же видео: поправляем позицию и play/pause
+    ignoreUntil.current = now + IGNORE_MS;
+
+    const cur = p.getCurrentTime();
+    const needSeek = Math.abs(cur - s.position) > SEEK_THRESHOLD;
+    if (needSeek) p.seekTo(s.position, true);
+
+    // Наш собственный прыжок не должен выглядеть как перемотка пользователя
+    trackerRef.current = { pos: needSeek ? s.position : cur, at: now };
+
+    if (s.isPlaying) p.playVideo();
+    else p.pauseVideo();
+  }, []);
+
+  // ---------- Публичный метод: применить чужое состояние ----------
+  const applyState = useCallback(
+    (s: PlayerState) => {
+      // Плеер ещё не создан или не готов: запоминаем, применим в onReady
+      if (!playerRef.current) {
+        pendingRef.current = s;
+
+        // У гостя видео ещё нет: монтируем <YouTube> с этим видео
+        if (videoIdRef.current === null) {
+          videoIdRef.current = s.videoId;
+          setStartVideoId(s.videoId);
         }
+        return;
+      }
 
-        // То же видео: поправляем позицию и play/pause
-        ignoreUntil.current = Date.now() + IGNORE_MS;
+      apply(s);
+    },
+    [apply],
+  );
 
-        if (Math.abs(p.getCurrentTime() - s.position) > SEEK_THRESHOLD) {
-            p.seekTo(s.position, true);
-        }
+  // ---------- Смонтировать плеер без запуска воспроизведения ----------
+  const preload = useCallback((videoId: string) => {
+    if (videoIdRef.current !== null) return;
+    videoIdRef.current = videoId;
+    setStartVideoId(videoId);
+  }, []);
 
-        if (s.isPlaying) p.playVideo();
-        else p.pauseVideo();
-    }, []);
+  // ---------- Временно игнорировать события плеера ----------
+  const suppress = useCallback((ms: number) => {
+    ignoreUntil.current = Math.max(ignoreUntil.current, Date.now() + ms);
+  }, []);
 
-    // ---------- Публичный метод: применить чужое состояние ----------
-    const applyState = useCallback(
-        (s: PlayerState) => {
-            // Плеер ещё не создан или не готов: запоминаем, применим в onReady
-            if (!playerRef.current) {
-                pendingRef.current = s;
+  // ---------- Обработчики для <YouTube> ----------
+  const handleReady = useCallback(
+    (e: YouTubeEvent) => {
+      playerRef.current = e.target as unknown as Player;
+      trackerRef.current = {
+        pos: playerRef.current.getCurrentTime(),
+        at: Date.now(),
+      };
+      setReady(true);
 
-                // У гостя видео ещё нет: монтируем <YouTube> с этим видео
-                if (videoIdRef.current === null) {
-                    videoIdRef.current = s.videoId;
-                    setStartVideoId(s.videoId);
-                }
-                return;
-            }
+      const pending = pendingRef.current;
+      if (pending) {
+        pendingRef.current = null;
+        apply(pending);
+      }
+    },
+    [apply],
+  );
 
-            apply(s);
-        },
-        [apply],
-    );
+  const handleStateChange = useCallback(
+    (e: YouTubeEvent<number>) => {
+      if (e.data !== PLAYING && e.data !== PAUSED) return;
 
-    // ---------- Обработчики для <YouTube> ----------
-    const handleReady = useCallback(
-        (e: YouTubeEvent) => {
-            playerRef.current = e.target as unknown as Player;
-            setReady(true);
+      const isPlaying = e.data === PLAYING;
+      const now = Date.now();
+      const exp = expected.current;
 
-            const pending = pendingRef.current;
-            if (pending) {
-                pendingRef.current = null;
-                apply(pending);
-            }
-        },
-        [apply],
-    );
+      // Ответ на нашу собственную команду, пусть и запоздавший
+      if (exp && now < exp.until && exp.isPlaying === isPlaying) {
+        expected.current = null;
+        const p = playerRef.current;
+        if (p) trackerRef.current = { pos: p.getCurrentTime(), at: now };
+        return;
+      }
 
-    const handleStateChange = useCallback(
-        (e: YouTubeEvent<number>) => {
-            if (e.data !== PLAYING && e.data !== PAUSED) return;
+      // Явная «глухота» (окно после команды, возврат на вкладку)
+      if (now < ignoreUntil.current) return;
 
-            const isPlaying = e.data === PLAYING;
-            const now = Date.now();
-            const exp = expected.current;
+      // Это действие человека: старое ожидание больше не актуально
+      expected.current = null;
 
-            // Ответ на нашу собственную команду, пусть и запоздавший
-            if (exp && now < exp.until && exp.isPlaying === isPlaying) {
-                expected.current = null;
-                return;
-            }
+      // То же самое мы только что отправили (например, сработал опрос)
+      const last = lastEmitRef.current;
+      if (last.isPlaying === isPlaying && now - last.at < DEDUPE_MS) return;
 
-            // Явная «глухота» (окно после команды, возврат на вкладку)
-            if (now < ignoreUntil.current) return;
+      emitLocal();
+    },
+    [emitLocal],
+  );
 
-            // Это действие человека: старое ожидание больше не актуально
-            expected.current = null;
+  const handleError = useCallback((e: YouTubeEvent<number>) => {
+    onErrorRef.current(errorText(e.data));
+  }, []);
 
-            const s = getState();
-            if (s) onLocalChangeRef.current(s);
-        },
-        [getState],
-    );
+  // ---------- Детектор перемотки (опрос позиции) ----------
+  useEffect(() => {
+    if (!ready) return;
 
-    const handleError = useCallback((e: YouTubeEvent<number>) => {
-        onErrorRef.current(errorText(e.data));
-    }, []);
+    const id = setInterval(() => {
+      const p = playerRef.current;
+      if (!p || !videoIdRef.current) return;
 
-    // ---------- Смонтировать плеер без запуска воспроизведения ----------
-    const preload = useCallback((videoId: string) => {
-        if (videoIdRef.current !== null) return; // видео уже есть
-        videoIdRef.current = videoId;
-        setStartVideoId(videoId);
-    }, []);
+      const now = Date.now();
+      const cur = p.getCurrentTime();
+      const st = p.getPlayerState();
 
-    const suppress = useCallback((ms: number) => {
-        ignoreUntil.current = Math.max(ignoreUntil.current, Date.now() + ms);
-    }, []);
+      const resetTracker = () => {
+        trackerRef.current = { pos: cur, at: now };
+      };
 
-    const handlers = useMemo(
-        () => ({
-            onReady: handleReady,
-            onStateChange: handleStateChange,
-            onError: handleError,
-        }),
-        [handleReady, handleStateChange, handleError],
-    );
+      // Мы сами командуем плеером
+      if (now < ignoreUntil.current) return resetTracker();
 
-    return { ready, startVideoId, getState, applyState, preload, suppress, handlers };
+      // Нас интересуют только устойчивые состояния
+      if (st !== PLAYING && st !== PAUSED) return resetTracker();
+
+      // Ждём, пока плеер дойдёт до состояния, которое мы ему задали
+      const exp = expected.current;
+      if (exp && now < exp.until && exp.isPlaying !== (st === PLAYING)) {
+        return resetTracker();
+      }
+
+      const t = trackerRef.current;
+      const playing = st === PLAYING;
+      const expectedPos = t.pos + (playing ? (now - t.at) / 1000 : 0);
+      const threshold = playing ? JUMP_PLAYING : JUMP_PAUSED;
+
+      if (Math.abs(cur - expectedPos) > threshold) {
+        emitLocal(); // перемотка пользователя
+        return;
+      }
+
+      trackerRef.current = { pos: cur, at: now };
+    }, POLL_MS);
+
+    return () => clearInterval(id);
+  }, [ready, emitLocal]);
+
+  const handlers = useMemo(
+    () => ({
+      onReady: handleReady,
+      onStateChange: handleStateChange,
+      onError: handleError,
+    }),
+    [handleReady, handleStateChange, handleError],
+  );
+
+  return {
+    ready,
+    startVideoId,
+    getState,
+    applyState,
+    preload,
+    suppress,
+    handlers,
+  };
 }
