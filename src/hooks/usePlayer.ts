@@ -11,6 +11,7 @@ const BUFFERING = 3;
 const IGNORE_MS = 800;        // окно игнора после обычной команды
 const IGNORE_LOAD_MS = 3000;  // окно игнора после загрузки нового видео
 const SEEK_THRESHOLD = 0.5;   // расхождение позиции, после которого делаем seekTo
+const EXPECT_MS = 15_000; // сколько ждём ответное событие на свою команду
 
 // Минимальный тип нативного плеера YouTube (методы синхронные)
 type Player = {
@@ -53,6 +54,8 @@ export function usePlayer({ initialVideoId, onLocalChange, onError }: Options) {
     const videoIdRef = useRef<string | null>(initialVideoId ?? null);
     const ignoreUntil = useRef(0);
     const pendingRef = useRef<PlayerState | null>(null);
+    const expected = useRef<{ isPlaying: boolean; until: number } | null>(null);
+
 
     // Всегда свежие колбэки без пересоздания обработчиков
     const onLocalChangeRef = useRef(onLocalChange);
@@ -80,6 +83,8 @@ export function usePlayer({ initialVideoId, onLocalChange, onError }: Options) {
     const apply = useCallback((s: PlayerState) => {
         const p = playerRef.current;
         if (!p) return;
+
+        expected.current = { isPlaying: s.isPlaying, until: Date.now() + EXPECT_MS };
 
         // Другое видео: загружаем с нужной позиции
         if (s.videoId !== videoIdRef.current) {
@@ -143,7 +148,22 @@ export function usePlayer({ initialVideoId, onLocalChange, onError }: Options) {
     const handleStateChange = useCallback(
         (e: YouTubeEvent<number>) => {
             if (e.data !== PLAYING && e.data !== PAUSED) return;
-            if (Date.now() < ignoreUntil.current) return; // эхо от нашей же команды
+
+            const isPlaying = e.data === PLAYING;
+            const now = Date.now();
+            const exp = expected.current;
+
+            // Ответ на нашу собственную команду, пусть и запоздавший
+            if (exp && now < exp.until && exp.isPlaying === isPlaying) {
+                expected.current = null;
+                return;
+            }
+
+            // Явная «глухота» (окно после команды, возврат на вкладку)
+            if (now < ignoreUntil.current) return;
+
+            // Это действие человека: старое ожидание больше не актуально
+            expected.current = null;
 
             const s = getState();
             if (s) onLocalChangeRef.current(s);
@@ -162,6 +182,10 @@ export function usePlayer({ initialVideoId, onLocalChange, onError }: Options) {
         setStartVideoId(videoId);
     }, []);
 
+    const suppress = useCallback((ms: number) => {
+        ignoreUntil.current = Math.max(ignoreUntil.current, Date.now() + ms);
+    }, []);
+
     const handlers = useMemo(
         () => ({
             onReady: handleReady,
@@ -171,5 +195,5 @@ export function usePlayer({ initialVideoId, onLocalChange, onError }: Options) {
         [handleReady, handleStateChange, handleError],
     );
 
-    return { ready, startVideoId, getState, applyState, preload, handlers };
+    return { ready, startVideoId, getState, applyState, preload, suppress, handlers };
 }

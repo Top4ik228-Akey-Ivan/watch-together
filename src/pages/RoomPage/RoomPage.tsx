@@ -64,6 +64,12 @@ function RoomContent({ roomId }: { roomId: string }) {
     onMessage: (m) => {
       setReceived((r) => ({ count: r.count + 1, last: m }));
 
+      if (m.t === "sync") {
+        const s = player.getState();
+        if (s) sendRef.current({ t: "state", ...s });
+        return;
+      }
+
       if (m.t !== "state") return;
 
       if (!entered) {
@@ -99,6 +105,16 @@ function RoomContent({ roomId }: { roomId: string }) {
       },
     });
   }, [player.getState, player.applyState, send]);
+
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      player.suppress(2500);                 // глушим «пробуждение» плеера
+      sendRef.current({ t: "sync" });        // просим актуальное состояние
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [player.suppress]);
 
   // ---------- Кнопка «Присоединиться» ----------
   const handleJoin = () => {
