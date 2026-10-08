@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 
 import {
@@ -12,12 +12,17 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { parseYoutubeUrl } from "@/lib/parseYoutubeUrl";
 import { createRoomId } from "@/lib/roomId";
+import { warmUpSignaling } from "@/lib/warmUp";
 
 export default function CreateRoomCard() {
   const navigate = useNavigate();
 
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    warmUpSignaling();
+  }, []);
 
   const handleCreateRoom = () => {
     const videoId = parseYoutubeUrl(url);

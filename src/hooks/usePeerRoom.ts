@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Peer, { type DataConnection } from "peerjs";
-import type { Msg, Status } from "@/lib/types";
+
 import { getPeerOptions } from "@/lib/peerOptions";
+import type { Msg, Status } from "@/lib/types";
 
 type Options = {
   roomId: string;
@@ -13,6 +14,18 @@ type Options = {
 const CONNECT_TIMEOUT_MS = 15_000;
 const PING_MS = 2_000;
 const DEAD_MS = 6_000;
+const RECONNECT_BASE_MS = 2_000;
+const RECONNECT_MAX_MS = 15_000;
+
+export const SIGNALING_DOWN_TEXT = "Нет связи с сервером";
+
+// Ошибки, которые относятся к серверу сигналинга, а не к партнёру
+const SIGNALING_ERRORS = new Set([
+  "network",
+  "server-error",
+  "socket-error",
+  "socket-closed",
+]);
 
 function peerErrorText(type: string): string {
   switch (type) {
@@ -24,7 +37,7 @@ function peerErrorText(type: string): string {
     case "server-error":
     case "socket-error":
     case "socket-closed":
-      return "Нет связи с сервером";
+      return SIGNALING_DOWN_TEXT;
     default:
       return "Ошибка соединения";
   }
@@ -38,7 +51,6 @@ export function usePeerRoom({ roomId, role, onMessage, onConnected }: Options) {
   const peerRef = useRef<Peer | null>(null);
   const connRef = useRef<DataConnection | null>(null);
 
-  // Всегда свежие колбэки, не заставляя эффект пересоздавать Peer
   const onMessageRef = useRef(onMessage);
   const onConnectedRef = useRef(onConnected);
   useEffect(() => {
@@ -50,7 +62,10 @@ export function usePeerRoom({ roomId, role, onMessage, onConnected }: Options) {
     let disposed = false;
     let connectTimer: ReturnType<typeof setTimeout> | undefined;
     let pingTimer: ReturnType<typeof setInterval> | undefined;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     let lastSeen = Date.now();
+    let registered = false; // были ли мы зарегистрированы на сервере сигналинга
+    let reconnectAttempts = 0;
 
     setStatus("connecting");
     setError(null);
@@ -79,6 +94,7 @@ export function usePeerRoom({ roomId, role, onMessage, onConnected }: Options) {
     const fail = (text: string) => {
       if (disposed) return;
       clearTimeout(connectTimer);
+      clearTimeout(reconnectTimer);
       stopLiveness();
       setError((prev) => prev ?? text); // первая ошибка не затирается
       setStatus("error");
@@ -139,11 +155,46 @@ export function usePeerRoom({ roomId, role, onMessage, onConnected }: Options) {
     );
     peerRef.current = peer;
 
-    // ---------- Общее ----------
+    // Регистрация на сервере прошла (в том числе повторная после reconnect)
+    peer.on("open", () => {
+      registered = true;
+      reconnectAttempts = 0;
+    });
+
+    // Переподключение к серверу сигналинга с нарастающей паузой
+    const scheduleReconnect = () => {
+      if (disposed || peer.destroyed) return;
+      clearTimeout(reconnectTimer);
+
+      const delay = Math.min(
+        RECONNECT_BASE_MS * 2 ** reconnectAttempts,
+        RECONNECT_MAX_MS,
+      );
+      reconnectAttempts += 1;
+
+      reconnectTimer = setTimeout(() => {
+        if (disposed || peer.destroyed || !peer.disconnected) return;
+        peer.reconnect();
+      }, delay);
+    };
+
+    peer.on("disconnected", () => {
+      if (disposed || peer.destroyed) return;
+      if (registered) scheduleReconnect();
+    });
+
     peer.on("error", (err) => {
       if (disposed) return;
-      // Если канал с партнёром жив, сбои сигналинга нам уже не важны
+
+      // Сервер моргнул, когда мы уже были зарегистрированы: тихо переподключаемся
+      if (registered && SIGNALING_ERRORS.has(err.type)) {
+        scheduleReconnect();
+        return;
+      }
+
+      // Канал с партнёром жив: остальные ошибки не важны
       if (connRef.current?.open) return;
+
       fail(peerErrorText(err.type));
     });
 
@@ -151,6 +202,8 @@ export function usePeerRoom({ roomId, role, onMessage, onConnected }: Options) {
     if (role === "host") {
       peer.on("open", () => {
         if (disposed) return;
+        // Повторное «open» после reconnect: гость на месте, статус не трогаем
+        if (connRef.current?.open) return;
         setStatus("waiting");
       });
 
@@ -159,7 +212,7 @@ export function usePeerRoom({ roomId, role, onMessage, onConnected }: Options) {
 
         const current = connRef.current;
 
-        // Уже есть гость: отказываем третьему
+        // Гость есть и отвечает: отказываем третьему
         if (current?.open && Date.now() - lastSeen < DEAD_MS) {
           c.on("open", () => {
             c.send({ t: "full" } satisfies Msg);
@@ -195,9 +248,10 @@ export function usePeerRoom({ roomId, role, onMessage, onConnected }: Options) {
     if (role === "guest") {
       peer.on("open", () => {
         if (disposed) return;
+        // Повторное «open» после reconnect: соединение с хостом уже есть
+        if (connRef.current) return;
 
-        let conn: DataConnection
-
+        let conn: DataConnection;
         try {
           conn = peer.connect(roomId, { reliable: true });
         } catch (e) {
@@ -212,6 +266,7 @@ export function usePeerRoom({ roomId, role, onMessage, onConnected }: Options) {
           CONNECT_TIMEOUT_MS,
         );
 
+        // Статус connected ставим не по open, а по welcome от хоста
         conn.on("data", (data) => handleData(data, conn));
         conn.on("close", () => fail("Хост закрыл комнату"));
         conn.on("error", () => fail("Ошибка соединения"));
@@ -237,6 +292,7 @@ export function usePeerRoom({ roomId, role, onMessage, onConnected }: Options) {
       disposed = true;
       window.removeEventListener("pagehide", sendBye);
       clearTimeout(connectTimer);
+      clearTimeout(reconnectTimer);
       stopLiveness();
       sendBye();
       connRef.current = null;

@@ -8,11 +8,16 @@ import StatusBadge from "@/components/StatusBadge/StatusBadge";
 import ChangeVideoForm from "@/components/ChangeVideoForm/ChangeVideoForm";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { usePeerRoom } from "@/hooks/usePeerRoom";
+import { SIGNALING_DOWN_TEXT, usePeerRoom } from "@/hooks/usePeerRoom";
+import { useSlowHint } from "@/hooks/useSlowHint";
+import { warmUpSignaling } from "@/lib/warmUp";
 import { usePlayer } from "@/hooks/usePlayer";
 import type { Msg, PlayerState } from "@/lib/types";
 import { PLAYER_OPTS } from "@/constants/player";
 import { HEARTBEAT_MS } from "@/constants/timers";
+
+
+
 
 // Было ли у страницы хоть одно взаимодействие пользователя (нужно для автоплея)
 function hadUserInteraction(): boolean {
@@ -36,16 +41,15 @@ function RoomContent({ roomId }: { roomId: string }) {
   const role: "host" | "guest" = location.state?.host ? "host" : "guest";
   const initialVideoId: string | undefined = location.state?.videoId;
 
-  const [entered, setEntered] = useState(hadUserInteraction);
   const pendingRef = useRef<PlayerState | null>(null);
   const pendingAtRef = useRef(0);
-
   // Мост между хуками: usePlayer нужен send, а он создаётся позже
   const sendRef = useRef<(m: Msg) => void>(() => { });
 
   // Счётчики для отладки
   const [sentCount, setSentCount] = useState(0);
   const [hbCount, setHbCount] = useState(0);
+  const [entered, setEntered] = useState(hadUserInteraction);
   const [received, setReceived] = useState<{ count: number; last: Msg | null }>({
     count: 0,
     last: null,
@@ -98,6 +102,27 @@ function RoomContent({ roomId }: { roomId: string }) {
     onConnected: () =>
       toast.success(role === "host" ? "Друг подключился" : "Вы в комнате"),
   });
+
+  // ---------- Прогрев сервера, подсказка и автоповтор ----------
+  useEffect(() => {
+    warmUpSignaling();
+  }, []);
+
+  const slow = useSlowHint(status === "connecting");
+
+  // Первая попытка к «спящему» серверу часто проваливается: повторяем один раз сами
+  const [autoRetried, setAutoRetried] = useState(false);
+  const autoRetrying =
+    status === "error" && error === SIGNALING_DOWN_TEXT && !autoRetried;
+
+  useEffect(() => {
+    if (!autoRetrying) return;
+    const id = setTimeout(() => {
+      setAutoRetried(true);
+      retry();
+    }, 3000);
+    return () => clearTimeout(id);
+  }, [autoRetrying, retry]);
 
   useEffect(() => {
     sendRef.current = send;
@@ -199,6 +224,16 @@ function RoomContent({ roomId }: { roomId: string }) {
         </Button>
       </header>
 
+      {slow && (
+        <p className="text-sm text-muted-foreground">
+          Сервер просыпается, это может занять до минуты…
+        </p>
+      )}
+
+      {autoRetrying && (
+        <p className="text-sm text-muted-foreground">Повторяем подключение…</p>
+      )}
+
       {/* Ссылка для друга */}
       {role === "host" && status === "waiting" && (
         <div className="space-y-2">
@@ -210,7 +245,7 @@ function RoomContent({ roomId }: { roomId: string }) {
       )}
 
       {/* Ошибка */}
-      {status === "error" && (
+      {status === "error" && !autoRetrying && (
         <Card className="border-destructive">
           <CardContent className="space-y-3 pt-6">
             <p role="alert" className="text-destructive">
