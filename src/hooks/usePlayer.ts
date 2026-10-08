@@ -20,6 +20,9 @@ const DEDUPE_MS = 400; // защита от двойной отправки од
 const UNSTARTED = -1;
 const CUED = 5;
 
+const HB_SEEK_THRESHOLD = 1.5; // расхождение, после которого пульс подтягивает позицию
+const HB_MISMATCH_LIMIT = 2;   // сколько пульсов подряд должны не совпадать по play/pause или видео
+
 // Минимальный тип нативного плеера YouTube (методы синхронные)
 type Player = {
     getPlayerState(): number;
@@ -71,6 +74,7 @@ export function usePlayer({
 
     // Трекер позиции для детектора перемотки: где плеер был и когда
     const trackerRef = useRef({ pos: 0, at: Date.now() });
+    const mismatchRef = useRef(0);
     // Последняя отправка (защита от дублей: событие + опрос на одно действие)
     const lastEmitRef = useRef({ at: 0, isPlaying: false });
 
@@ -118,6 +122,7 @@ export function usePlayer({
     const apply = useCallback((s: PlayerState) => {
         const p = playerRef.current;
         if (!p) return;
+        mismatchRef.current = 0;
 
         const now = Date.now();
         const st = p.getPlayerState();
@@ -189,6 +194,72 @@ export function usePlayer({
     const suppress = useCallback((ms: number) => {
         ignoreUntil.current = Math.max(ignoreUntil.current, Date.now() + ms);
     }, []);
+
+    // ---------- Для хоста: что отправлять в пульсе ----------
+    const getBeat = useCallback((): PlayerState | null => {
+        const p = playerRef.current;
+        if (!p || !videoIdRef.current) return null;
+
+        // Видео только что меняли: позиция ещё от старого
+        if (Date.now() < ignoreUntil.current) return null;
+
+        // Буферизация или не начато: позиция недостоверна, пропускаем такт
+        const st = p.getPlayerState();
+        if (st === BUFFERING || st === UNSTARTED) return null;
+
+        return getState();
+    }, [getState]);
+
+    // ---------- Для гостя: применить пульс ----------
+    const applyHeartbeat = useCallback(
+        (s: PlayerState) => {
+            const p = playerRef.current;
+
+            // Плеера ещё нет: обычный путь (смонтирует плеер и отложит состояние)
+            if (!p) {
+                applyState(s);
+                return;
+            }
+
+            const now = Date.now();
+            if (now < ignoreUntil.current) return; // мы сами только что командовали
+
+            const st = p.getPlayerState();
+            if (st === BUFFERING) return; // идёт загрузка, позиция недостоверна
+
+            const playing = st === PLAYING;
+            const notStarted = st === UNSTARTED || st === CUED;
+            const sameMode =
+                s.videoId === videoIdRef.current && s.isPlaying === playing;
+
+            // 1. Видео или play/pause не совпадают: ждём подтверждения следующим пульсом.
+            //    Так запоздавший пульс не отменит только что нажатую паузу.
+            if (!sameMode) {
+                mismatchRef.current += 1;
+                if (mismatchRef.current >= HB_MISMATCH_LIMIT) {
+                    mismatchRef.current = 0;
+                    apply(s); // реально потеряли команду: применяем полностью
+                }
+                return;
+            }
+            mismatchRef.current = 0;
+
+            // 2. Режим совпал: правим только позицию, и только при заметном расхождении
+            if (Math.abs(p.getCurrentTime() - s.position) <= HB_SEEK_THRESHOLD) return;
+
+            ignoreUntil.current = now + IGNORE_MS;
+            trackerRef.current = { pos: s.position, at: now };
+
+            if (notStarted) {
+                // seekTo на незапущенном плеере даёт чёрный экран: подготавливаем заново
+                p.cueVideoById({ videoId: s.videoId, startSeconds: s.position });
+            } else {
+                expected.current = { isPlaying: s.isPlaying, until: now + EXPECT_MS };
+                p.seekTo(s.position, true);
+            }
+        },
+        [apply, applyState],
+    );
 
     // ---------- Обработчики для <YouTube> ----------
     const handleReady = useCallback(
@@ -301,7 +372,9 @@ export function usePlayer({
         ready,
         startVideoId,
         getState,
+        getBeat,
         applyState,
+        applyHeartbeat,
         preload,
         suppress,
         handlers,

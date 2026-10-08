@@ -12,6 +12,7 @@ import { usePeerRoom } from "@/hooks/usePeerRoom";
 import { usePlayer } from "@/hooks/usePlayer";
 import type { Msg, PlayerState } from "@/lib/types";
 import { PLAYER_OPTS } from "@/constants/player";
+import { HEARTBEAT_MS } from "@/constants/timers";
 
 // Было ли у страницы хоть одно взаимодействие пользователя (нужно для автоплея)
 function hadUserInteraction(): boolean {
@@ -44,6 +45,7 @@ function RoomContent({ roomId }: { roomId: string }) {
 
   // Счётчики для отладки
   const [sentCount, setSentCount] = useState(0);
+  const [hbCount, setHbCount] = useState(0);
   const [received, setReceived] = useState<{ count: number; last: Msg | null }>({
     count: 0,
     last: null,
@@ -72,23 +74,26 @@ function RoomContent({ roomId }: { roomId: string }) {
     roomId,
     role,
     onMessage: (m) => {
-      setReceived((r) => ({ count: r.count + 1, last: m }));
+      if (m.t === "state" && m.hb) setHbCount((c) => c + 1);
+      else setReceived((r) => ({ count: r.count + 1, last: m }));
 
       if (m.t === "sync") {
         const s = player.getState();
         if (s) sendRef.current({ t: "state", ...s });
         return;
       }
-
       if (m.t !== "state") return;
 
+      // Гость ещё не нажал «Присоединиться»: запоминаем последнее состояние
       if (!entered) {
         pendingRef.current = m;
         pendingAtRef.current = Date.now();
         player.preload(m.videoId);
         return;
       }
-      player.applyState(m);
+
+      if (m.hb) player.applyHeartbeat(m);
+      else player.applyState(m);
     },
     onConnected: () =>
       toast.success(role === "host" ? "Друг подключился" : "Вы в комнате"),
@@ -104,6 +109,17 @@ function RoomContent({ roomId }: { roomId: string }) {
     const s = player.getState();
     if (s) send({ t: "state", ...s });
   }, [role, status, player.ready, player.getState, send]);
+
+  useEffect(() => {
+    if (role !== "host" || status !== "connected" || !player.ready) return;
+
+    const id = setInterval(() => {
+      const s = player.getBeat();
+      if (s) send({ t: "state", hb: true, ...s });
+    }, HEARTBEAT_MS);
+
+    return () => clearInterval(id);
+  }, [role, status, player.ready, player.getBeat, send]);
 
   // ---------- Консольный доступ для ручных тестов (только dev) ----------
   useEffect(() => {
@@ -247,7 +263,7 @@ function RoomContent({ roomId }: { roomId: string }) {
               entered: {String(entered)}
             </div>
             <div>
-              отправлено: {sentCount} | получено: {received.count}
+              отправлено: {sentCount} | получено: {received.count} | пульсов получено: {hbCount}
             </div>
             <pre className="overflow-x-auto rounded bg-muted p-2">
               {received.last
